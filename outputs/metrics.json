@@ -1,0 +1,10 @@
+{
+  "repo": "cross-chain-bridge",
+  "toolchain": "forge 1.0.0, solc 0.8.24, local EVM (forge test), mock endpoint and mock tokens",
+  "tests_total": 7,
+  "tests_passed": 7,
+  "tests_failed": 0,
+  "round_trip": "lock 100 tokens on source bridge, deliver, 100 wrapped minted to receiver",
+  "replay_test": "delivering the same message twice reverts on the nonce check; balance stays at the first mint",
+  "note": "Two bridge instances on one local EVM stand in for two chains. No real LayerZero endpoint, no deployment, no cross chain timing measured."
+}

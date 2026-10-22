@@ -1,0 +1,15 @@
+Compiling 1 files with Solc 0.8.24
+Solc 0.8.24 finished in 811.44ms
+Compiler run successful!
+
+Ran 7 tests for test/Bridge.t.sol:BridgeTest
+[PASS] testDailyLimitBlocksOverLimit() (gas: 20034)
+[PASS] testLockAndMintRoundTrip() (gas: 382776)
+[PASS] testOnlyEndpointCanDeliver() (gas: 300413)
+[PASS] testOutOfOrderNonceReverts() (gas: 318153)
+[PASS] testReplaySameMessageReverts() (gas: 386571)
+[PASS] testSequentialMessagesMintInOrder() (gas: 403746)
+[PASS] testUntrustedRemoteReverts() (gas: 300417)
+Suite result: ok. 7 passed; 0 failed; 0 skipped; finished in 2.83ms (1.82ms CPU time)
+
+Ran 1 test suite in 3.71ms (2.83ms CPU time): 7 tests passed, 0 failed, 0 skipped (7 total tests)

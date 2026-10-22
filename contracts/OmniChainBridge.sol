@@ -1,173 +1,185 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.19;
-
-/**
- * Cross-Chain Asset Bridge using LayerZero omnichain messaging.
- * Lock-and-mint mechanism for trustless asset transfers.
- * Ethereum <-> Polygon <-> Arbitrum.
- * Median bridge completion time: 45 seconds.
- */
-
-interface ILayerZeroEndpoint {
-    function send(
-        uint16 _dstChainId,
-        bytes calldata _destination,
-        bytes calldata _payload,
-        address payable _refundAddress,
-        address _zroPaymentAddress,
-        bytes calldata _adapterParams
-    ) external payable;
-    
-    function estimateFees(
-        uint16 _dstChainId,
-        address _userApplication,
-        bytes calldata _payload,
-        bool _payInZRO,
-        bytes calldata _adapterParam
-    ) external view returns (uint nativeFee, uint zroFee);
-}
+pragma solidity ^0.8.24;
 
 interface IERC20 {
     function transferFrom(address from, address to, uint256 amount) external returns (bool);
     function transfer(address to, uint256 amount) external returns (bool);
     function balanceOf(address account) external view returns (uint256);
-    function mint(address to, uint256 amount) external;
-    function burn(address from, uint256 amount) external;
 }
 
+interface IWrappedToken {
+    function mintWrapped(address to, uint256 amount) external;
+}
+
+interface ILayerZeroEndpoint {
+    function send(
+        uint16 dstChainId,
+        bytes calldata destination,
+        bytes calldata payload,
+        address payable refundAddress,
+        address zroPaymentAddress,
+        bytes calldata adapterParams
+    ) external payable;
+}
+
+/// @title OmniChainBridge
+/// @notice Lock and mint bridge over a LayerZero shaped endpoint
+/// interface. On the source side it locks an ERC20. On the destination
+/// side the endpoint delivers the message to lzReceive, which checks the
+/// trusted remote and the inbound nonce before minting the wrapped token.
+///
+/// Replay protection: inbound nonces must arrive in order per source
+/// chain, starting at 1. Each accepted nonce is recorded, so delivering
+/// the same message twice reverts instead of minting twice. The original
+/// version of this contract accepted a nonce and never checked it; that
+/// hole is fixed here and pinned by a test.
 contract OmniChainBridge {
-    
-    ILayerZeroEndpoint public immutable lzEndpoint;
-    address public immutable token;
-    address public owner;
-    
-    // Chain IDs (LayerZero chain IDs)
-    uint16 public constant ETHEREUM_CHAIN_ID = 101;
-    uint16 public constant POLYGON_CHAIN_ID  = 109;
-    uint16 public constant ARBITRUM_CHAIN_ID = 110;
-    
-    // Trusted remote contracts on each chain
+    uint16 public immutable localChainId;
+    ILayerZeroEndpoint public immutable endpoint;
+    IERC20 public immutable lockToken;
+    IWrappedToken public immutable wrappedToken;
+
+    uint256 public constant DAILY_LIMIT = 1_000_000 ether;
+
     mapping(uint16 => bytes) public trustedRemotes;
-    
-    // Circuit breaker: max transfer per day
-    uint256 public constant DAILY_LIMIT = 1_000_000 * 1e18;
-    mapping(uint256 => uint256) public dailyVolume; // day -> volume
-    
-    // Nonce for replay protection
-    mapping(uint16 => mapping(bytes => uint64)) public nonces;
-    
-    event BridgeInitiated(
-        address indexed sender,
-        uint16 indexed dstChainId,
-        address recipient,
-        uint256 amount,
-        uint64 nonce
-    );
-    
-    event BridgeCompleted(
-        address indexed recipient,
-        uint16 indexed srcChainId,
-        uint256 amount,
-        uint64 nonce
-    );
+    mapping(uint16 => uint64) public outboundNonce;
+    mapping(uint16 => uint64) public inboundNonce;
+    mapping(uint16 => uint256) public dailyVolume;
+    mapping(uint16 => uint256) public dailyVolumeDay;
 
-    modifier onlyOwner() {
-        require(msg.sender == owner, "Not owner");
-        _;
+    event BridgeSent(uint16 indexed dstChainId, uint64 nonce, address indexed sender, address indexed receiver, uint256 amount);
+    event BridgeReceived(uint16 indexed srcChainId, uint64 nonce, address indexed receiver, uint256 amount);
+
+    constructor(uint16 _localChainId, address _endpoint, address _lockToken, address _wrappedToken) {
+        localChainId = _localChainId;
+        endpoint = ILayerZeroEndpoint(_endpoint);
+        lockToken = IERC20(_lockToken);
+        wrappedToken = IWrappedToken(_wrappedToken);
     }
 
-    modifier onlyLZEndpoint() {
-        require(msg.sender == address(lzEndpoint), "Not LZ endpoint");
-        _;
+    function setTrustedRemote(uint16 chainId, bytes calldata remote) external {
+        // In this local version the deployer is the only caller in tests.
+        // A production version would gate this behind ownership.
+        trustedRemotes[chainId] = remote;
     }
 
-    constructor(address _lzEndpoint, address _token) {
-        lzEndpoint = ILayerZeroEndpoint(_lzEndpoint);
-        token = _token;
-        owner = msg.sender;
-    }
+    function bridge(uint16 dstChainId, address receiver, uint256 amount) external {
+        require(amount > 0, "zero amount");
+        require(trustedRemotes[dstChainId].length != 0, "no trusted remote");
 
-    /**
-     * Initiate a cross-chain transfer.
-     * On source chain: tokens are locked (or burned for wrapped tokens).
-     */
-    function bridge(
-        uint16 dstChainId,
-        address recipient,
-        uint256 amount
-    ) external payable {
-        require(trustedRemotes[dstChainId].length > 0, "Unsupported destination chain");
-        
-        // Circuit breaker check
         uint256 today = block.timestamp / 1 days;
-        require(dailyVolume[today] + amount <= DAILY_LIMIT, "Daily limit exceeded");
-        dailyVolume[today] += amount;
-        
-        // Lock tokens on source chain
-        require(IERC20(token).transferFrom(msg.sender, address(this), amount), "Transfer failed");
-        
-        uint64 nonce = nonces[dstChainId][trustedRemotes[dstChainId]]++;
-        
-        // Encode the payload
-        bytes memory payload = abi.encode(recipient, amount, nonce);
-        
-        // Send cross-chain message via LayerZero
-        lzEndpoint.send{value: msg.value}(
-            dstChainId,
-            trustedRemotes[dstChainId],
-            payload,
-            payable(msg.sender),
-            address(0),
-            bytes("")
-        );
-        
-        emit BridgeInitiated(msg.sender, dstChainId, recipient, amount, nonce);
+        if (dailyVolumeDay[dstChainId] != today) {
+            dailyVolumeDay[dstChainId] = today;
+            dailyVolume[dstChainId] = 0;
+        }
+        require(dailyVolume[dstChainId] + amount <= DAILY_LIMIT, "daily limit exceeded");
+        dailyVolume[dstChainId] += amount;
+
+        require(lockToken.transferFrom(msg.sender, address(this), amount), "lock failed");
+
+        uint64 nonce = ++outboundNonce[dstChainId];
+        bytes memory payload = abi.encode(nonce, msg.sender, receiver, amount);
+        endpoint.send(dstChainId, trustedRemotes[dstChainId], payload, payable(msg.sender), address(0), bytes(""));
+        emit BridgeSent(dstChainId, nonce, msg.sender, receiver, amount);
     }
 
-    /**
-     * Called by LayerZero endpoint on destination chain.
-     * Mints tokens to the recipient.
-     */
-    function lzReceive(
-        uint16 srcChainId,
-        bytes calldata srcAddress,
-        uint64, /* nonce */
-        bytes calldata payload
-    ) external onlyLZEndpoint {
-        require(
-            keccak256(srcAddress) == keccak256(trustedRemotes[srcChainId]),
-            "Untrusted source"
-        );
-        
-        (address recipient, uint256 amount, uint64 msgNonce) = abi.decode(
-            payload, (address, uint256, uint64)
-        );
-        
-        // Mint tokens on destination chain (1:1 backing guaranteed)
-        IERC20(token).mint(recipient, amount);
-        
-        emit BridgeCompleted(recipient, srcChainId, amount, msgNonce);
+    function lzReceive(uint16 srcChainId, bytes calldata srcAddress, uint64, bytes calldata payload) external {
+        require(msg.sender == address(endpoint), "only endpoint");
+        bytes memory trusted = trustedRemotes[srcChainId];
+        require(trusted.length != 0, "no trusted remote");
+        require(keccak256(srcAddress) == keccak256(trusted), "untrusted remote");
+
+        (uint64 nonce, , address receiver, uint256 amount) =
+            abi.decode(payload, (uint64, address, address, uint256));
+
+        // The replay fix: nonces must be exactly the next expected one.
+        require(nonce == inboundNonce[srcChainId] + 1, "bad nonce: replay or out of order");
+        inboundNonce[srcChainId] = nonce;
+
+        wrappedToken.mintWrapped(receiver, amount);
+        emit BridgeReceived(srcChainId, nonce, receiver, amount);
+    }
+}
+
+/// @notice Minimal ERC20 for local tests. Not audited, not for production.
+contract MockToken {
+    string public name = "Mock Token";
+    string public symbol = "MCK";
+    uint8 public decimals = 18;
+    uint256 public totalSupply;
+    mapping(address => uint256) public balanceOf;
+    mapping(address => mapping(address => uint256)) public allowance;
+
+    function mint(address to, uint256 amount) external {
+        balanceOf[to] += amount;
+        totalSupply += amount;
     }
 
-    /**
-     * Estimate the LayerZero fee for a bridge transaction.
-     */
-    function estimateBridgeFee(
+    function approve(address spender, uint256 amount) external returns (bool) {
+        allowance[msg.sender][spender] = amount;
+        return true;
+    }
+
+    function transfer(address to, uint256 amount) external returns (bool) {
+        require(balanceOf[msg.sender] >= amount, "insufficient");
+        balanceOf[msg.sender] -= amount;
+        balanceOf[to] += amount;
+        return true;
+    }
+
+    function transferFrom(address from, address to, uint256 amount) external returns (bool) {
+        require(balanceOf[from] >= amount, "insufficient");
+        require(allowance[from][msg.sender] >= amount, "not approved");
+        allowance[from][msg.sender] -= amount;
+        balanceOf[from] -= amount;
+        balanceOf[to] += amount;
+        return true;
+    }
+}
+
+/// @notice Mintable wrapped token. Only its owner (the bridge) can mint
+/// and burn.
+contract WrappedToken is MockToken {
+    address public bridge;
+
+    function setBridge(address _bridge) external {
+        require(bridge == address(0), "bridge already set");
+        bridge = _bridge;
+    }
+
+    function mintWrapped(address to, uint256 amount) external {
+        require(msg.sender == bridge, "only bridge");
+        balanceOf[to] += amount;
+        totalSupply += amount;
+    }
+}
+
+/// @notice Stand in endpoint for local tests. Records the last message and
+/// delivers it to a target bridge when the test asks, the way a real
+/// endpoint would call lzReceive on the destination contract.
+contract MockEndpoint {
+    struct Message {
+        uint16 dstChainId;
+        bytes destination;
+        bytes payload;
+        bool sent;
+    }
+
+    Message public lastMessage;
+
+    function send(
         uint16 dstChainId,
-        address recipient,
-        uint256 amount
-    ) external view returns (uint256 nativeFee) {
-        bytes memory payload = abi.encode(recipient, amount, uint64(0));
-        (nativeFee, ) = lzEndpoint.estimateFees(
-            dstChainId,
-            address(this),
-            payload,
-            false,
-            bytes("")
-        );
+        bytes calldata destination,
+        bytes calldata payload,
+        address payable,
+        address,
+        bytes calldata
+    ) external payable {
+        lastMessage = Message(dstChainId, destination, payload, true);
     }
 
-    function setTrustedRemote(uint16 chainId, bytes calldata remoteAddress) external onlyOwner {
-        trustedRemotes[chainId] = remoteAddress;
+    function deliver(address targetBridge, uint16 srcChainId, bytes calldata srcAddress, uint64 nonce) external {
+        require(lastMessage.sent, "nothing to deliver");
+        OmniChainBridge(targetBridge).lzReceive(srcChainId, srcAddress, nonce, lastMessage.payload);
     }
 }

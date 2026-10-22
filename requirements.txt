@@ -1,0 +1,1 @@
+# Foundry (forge) 1.0.0 with solc 0.8.24. Python only for scripts/measure.py (standard library).
